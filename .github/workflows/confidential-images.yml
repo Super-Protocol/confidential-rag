@@ -16,6 +16,12 @@ on:
 permissions:
   contents: read
   packages: write
+  # The catalog's pin gate verifies every first-party digest it bundles against a
+  # GitHub build attestation (scripts/verify-pins). Without these two the image is
+  # published and unpinnable: digest -> attestation -> commit is the only direction
+  # that check runs in, and a tag agreeing with a digest proves nothing.
+  id-token: write
+  attestations: write
 
 jobs:
   rag-server:
@@ -48,6 +54,15 @@ jobs:
             ghcr.io/super-protocol/confidential-rag/rag-server:${{ steps.tag.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Pushed to the registry as well as to the API: this repository is public, but
+      # the gate reads `--bundle-from-oci` first so that a private source repository
+      # does not need the reader's token to have access to its attestations.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/super-protocol/confidential-rag/rag-server
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: The digest a listing pins
         run: |
