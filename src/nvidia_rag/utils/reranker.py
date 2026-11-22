@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: added the `tei` ranking engine, so retrieved
+# documents can be reranked by an open cross-encoder instead of the NeMo
+# Retriever reranking NIM.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -25,6 +29,7 @@ from langchain_nvidia_ai_endpoints import NVIDIARerank
 
 from nvidia_rag.utils.common import NVIDIA_API_DEFAULT_HEADERS, sanitize_nim_url
 from nvidia_rag.utils.configuration import NvidiaRAGConfig
+from nvidia_rag.utils.tei_reranker import TEIRerank
 from nvidia_rag.utils.vlm_reranker import (
     NVIDIAVLMRerank,
     _build_vlm_rerank_invoke_url,
@@ -35,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "NVIDIAVLMRerank",
+    "TEIRerank",
     "_build_vlm_rerank_invoke_url",
     "_is_vlm_reranker_model",
     "_get_ranking_model",
@@ -74,6 +80,24 @@ def _get_ranking_model(
         )
     elif top_n <= 0:
         raise ValueError(f"reranker_top_k must be greater than 0, got {top_n}")
+
+    # Modified by Super Protocol, 2026: an open cross-encoder over Text
+    # Embeddings Inference. `url` is the server's root rather than a `/v1`
+    # prefix — TEI serves reranking at `/rerank` — and the adapter tolerates
+    # either.
+    if config.ranking.model_engine == "tei":
+        if not url:
+            raise RuntimeError(
+                "Ranking engine 'tei' needs APP_RANKING_SERVERURL: there is no "
+                "hosted catalogue to fall back to for an open reranker."
+            )
+        logger.info("Using TEI ranking model %s hosted at %s", model, url)
+        return TEIRerank(
+            base_url=url,
+            model=model,
+            api_key=config.ranking.get_api_key(),
+            top_n=top_n,
+        )
 
     if config.ranking.model_engine == "nvidia-ai-endpoints":
         api_key = config.ranking.get_api_key()
@@ -119,7 +143,7 @@ def _get_ranking_model(
     # Unsupported engine
     raise RuntimeError(
         f"Unsupported ranking model engine: '{config.ranking.model_engine}'. "
-        f"Supported engines: 'nvidia-ai-endpoints'"
+        f"Supported engines: 'nvidia-ai-endpoints', 'tei'"
     )
 
 

@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: added the `openai` LLM engine, so generation
+# can be served by an open OpenAI-compatible endpoint (vLLM) instead of an
+# NVIDIA NIM or the hosted API catalogue.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,7 +19,8 @@
 
 """The wrapper for interacting with llm models and pre or postprocessing LLM response.
 1. get_prompts: Get the prompts from the YAML file.
-2. get_llm: Get the LLM model. Uses the NVIDIA AI Endpoints or OpenAI.
+2. get_llm: Get the LLM model. Uses an OpenAI-compatible endpoint, the NVIDIA
+   AI Endpoints, or OpenAI.
 3. extract_reasoning_and_content: Extract reasoning and content from response chunks.
 4. streaming_filter_think: Filter the think tokens from the LLM response (sync).
 5. streaming_split_reasoning_async: Split answer and reasoning tokens (async).
@@ -339,6 +344,48 @@ def get_llm(config: NvidiaRAGConfig | None = None, **kwargs) -> LLM | SimpleChat
         config.llm.model_engine,
         kwargs.get("model"),
     )
+    # Modified by Super Protocol, 2026: a plain OpenAI-compatible chat endpoint.
+    #
+    # Separate from the branch below rather than folded into it. `ChatNVIDIA`
+    # with a non-NVIDIA `base_url` happens to work against an OpenAI-shaped
+    # server today, but it probes the endpoint, carries NVIDIA's default headers
+    # and decides which generation parameters to send from a model-name table —
+    # three behaviours whose future depends on NVIDIA's client, in the one code
+    # path this port exists to take off it.
+    #
+    # `min_tokens` and `ignore_eos` are not sent: they are NIM extensions, and
+    # vLLM would take them only inside `extra_body`. The reasoning config is not
+    # bound either — `_bind_reasoning_config` writes Nemotron's own
+    # `chat_template_kwargs`, which an open checkpoint does not read.
+    if config.llm.model_engine == "openai":
+        if not url:
+            raise RuntimeError(
+                "LLM engine 'openai' needs APP_LLM_SERVERURL: there is no hosted "
+                "catalogue to fall back to for an open endpoint."
+            )
+        api_key = kwargs.get("api_key") or config.llm.get_api_key()
+        openai_kwargs: dict[str, Any] = {
+            "model": kwargs.get("model"),
+            "base_url": url,
+            # An OpenAI client refuses to be built without one, and the endpoint
+            # this talks to does authenticate.
+            "api_key": api_key or "not-used",
+        }
+        if kwargs.get("temperature") is not None:
+            openai_kwargs["temperature"] = kwargs["temperature"]
+        if kwargs.get("top_p") is not None:
+            openai_kwargs["top_p"] = kwargs["top_p"]
+        if kwargs.get("max_tokens") is not None:
+            openai_kwargs["max_completion_tokens"] = kwargs["max_tokens"]
+        if kwargs.get("stop"):
+            openai_kwargs["stop"] = kwargs["stop"]
+        logger.info(
+            "Using OpenAI-compatible llm model %s hosted at %s",
+            kwargs.get("model"),
+            url,
+        )
+        return ChatOpenAI(**openai_kwargs)
+
     if config.llm.model_engine == "nvidia-ai-endpoints":
         # Use ChatOpenAI with guardrails if enabled
         # TODO Add the ChatNVIDIA implementation when available
@@ -477,7 +524,9 @@ def get_llm(config: NvidiaRAGConfig | None = None, **kwargs) -> LLM | SimpleChat
         return llm
 
     raise RuntimeError(
-        "Unable to find any supported Large Language Model server. Supported engine name is nvidia-ai-endpoints."
+        "Unable to find any supported Large Language Model server. Supported "
+        f"engine names are openai and nvidia-ai-endpoints; APP_LLM_MODELENGINE "
+        f"is {config.llm.model_engine!r}."
     )
 
 

@@ -1,0 +1,55 @@
+# Builds the one image this fork publishes.
+#
+# Published to GitHub Container Registry so a marketplace listing can pin it by
+# digest and a confidential cluster space can pull it anonymously — no NGC
+# credential, no NVIDIA AI Enterprise entitlement, nothing for a tenant to hold.
+name: confidential images
+
+on:
+  push:
+    branches:
+      - confidential/**
+    tags:
+      - confidential-v*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rag-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # An immutable tag, because a listing's `images:` digest is only a pin if
+      # the thing beside it cannot be rebuilt under the same name.
+      - name: Tag from the commit
+        id: tag
+        run: echo "tag=2.6.2-sp.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: src/nvidia_rag/rag_server/Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/super-protocol/confidential-rag/rag-server:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The digest a listing pins
+        run: |
+          echo "ghcr.io/super-protocol/confidential-rag/rag-server:${{ steps.tag.outputs.tag }}"
+          echo "${{ steps.build.outputs.digest }}"

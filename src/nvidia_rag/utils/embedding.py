@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: added the `openai` embedding engine, so the
+# retriever can be served by an open OpenAI-compatible embedding endpoint
+# (Text Embeddings Inference) instead of the NeMo Retriever embedding NIM.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -14,7 +18,8 @@
 # limitations under the License.
 
 """The wrapper for interacting with embedding models.
-1. get_embedding_model: Get the embedding model. Uses the NVIDIA AI Endpoints or HuggingFace.
+1. get_embedding_model: Get the embedding model. Uses an OpenAI-compatible
+   endpoint, the NVIDIA AI Endpoints, or HuggingFace.
 """
 
 import logging
@@ -23,6 +28,7 @@ from functools import lru_cache
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.embeddings import Embeddings
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
+from langchain_openai import OpenAIEmbeddings
 
 from nvidia_rag.utils.common import NVIDIA_API_DEFAULT_HEADERS, sanitize_nim_url
 from nvidia_rag.utils.configuration import NvidiaRAGConfig
@@ -55,6 +61,27 @@ def get_embedding_model(
         config.embeddings.model_engine,
         model,
     )
+
+    # Modified by Super Protocol, 2026: an OpenAI-compatible embedding endpoint.
+    #
+    # `truncate` and `input_type` are NeMo Retriever extensions, not part of the
+    # OpenAI embeddings request, and an open server rejects or ignores them — so
+    # neither is sent here. `check_embedding_ctx_length=False` keeps langchain
+    # from tokenising with tiktoken and splitting the input itself: the server
+    # owns truncation (TEI is started with `--auto-truncate`), and a client-side
+    # split would silently change what gets embedded. `dimensions` is likewise
+    # omitted: an open checkpoint returns the width it returns, and asking for
+    # another one is how a collection ends up with vectors of two widths.
+    if config.embeddings.model_engine == "openai":
+        api_key = config.embeddings.get_api_key()
+        logger.info("Using OpenAI-compatible embedding model %s hosted at %s", model, url)
+        return OpenAIEmbeddings(
+            base_url=url,
+            model=model,
+            api_key=api_key or "not-used",
+            check_embedding_ctx_length=False,
+            tiktoken_enabled=False,
+        )
 
     if config.embeddings.model_engine == "nvidia-ai-endpoints":
         api_key = config.embeddings.get_api_key()
@@ -97,5 +124,7 @@ def get_embedding_model(
             )
 
     raise RuntimeError(
-        "Unable to find any supported embedding model. Supported engine is huggingface and nvidia-ai-endpoints."
+        "Unable to find any supported embedding model. Supported engines are "
+        f"openai and nvidia-ai-endpoints; APP_EMBEDDINGS_MODELENGINE is "
+        f"{config.embeddings.model_engine!r}."
     )

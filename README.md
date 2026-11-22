@@ -1,3 +1,25 @@
+<h1>Confidential RAG</h1>
+
+> Based on the open-source [NVIDIA RAG reference architecture](https://github.com/NVIDIA-AI-Blueprints/rag),
+> Apache-2.0, forked at release `v2.6.2`
+> (commit `f20716d73ae69a544ad4a692f38d6178a64e6f36`) and modified by Super Protocol — see
+> [`MODIFICATIONS.md`](MODIFICATIONS.md). NVIDIA archived the upstream repository on 2026-11-05 and it
+> no longer moves; this fork is maintained by Super Protocol. NVIDIA is a trademark of NVIDIA
+> Corporation. This fork is not produced, endorsed or supported by NVIDIA.
+
+This fork runs the reference architecture with **no licence-encumbered component**: generation on
+vLLM, embedding and reranking on open checkpoints served by Text Embeddings Inference, Milvus as the
+vector store. No NVIDIA AI Enterprise entitlement, no NGC credential, no closed container in the
+middle of a system whose point is that you can verify what ran.
+
+It is deployed through the Swarm Cloud Marketplace as the **Confidential RAG** listing, which pins
+the image published from this branch by digest and publishes signed evidence of the exact
+configuration a deployment is running.
+
+Upstream's own documentation follows, unchanged.
+
+---
+
 <h1>NVIDIA RAG Blueprint</h1>
 
 Retrieval-Augmented Generation (RAG) combines the reasoning power of large language models (LLMs)

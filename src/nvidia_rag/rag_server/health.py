@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: the dependency probes now ask each engine for
+# the readiness path it actually serves. `/v1/health/ready` is a NIM route; vLLM
+# and Text Embeddings Inference answer on `/health`, so an open stack reported
+# every one of its components unhealthy while serving correctly.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -216,6 +221,27 @@ async def check_object_store_health(
         )
 
 
+def readiness_url(url: str, engine: str) -> str:
+    """Where this engine answers a readiness probe.
+
+    Added by Super Protocol, 2026. `nvidia-ai-endpoints` keeps upstream's
+    `/v1/health/ready`, which is the route a NIM serves. The open engines this
+    port adds — `openai` for vLLM, `tei` for Text Embeddings Inference — serve
+    `/health` at the root, outside any version prefix and outside the endpoint's
+    own authentication, which is what makes it usable as a probe.
+    """
+    base = url if url.startswith(("http://", "https://")) else f"http://{url}"
+    base = base.rstrip("/")
+    if engine in ("openai", "tei"):
+        # Strip a version prefix the operator supplied for the inference route:
+        # the embedding URL needs `/v1`, the health route must not carry it.
+        base = re.sub(r"/v\d+$", "", base)
+        return f"{base}/health"
+    if re.search(r"/v\d+(?:/|$)", base):
+        return f"{base}/health/ready"
+    return f"{base}/v1/health/ready"
+
+
 def is_nvidia_api_catalog_url(url: str) -> bool:
     """Check if the URL is from NVIDIA API Catalog"""
     if not url:
@@ -274,11 +300,7 @@ async def check_all_services_health(
 
     # LLM service health check
     if config.llm.server_url and not is_nvidia_api_catalog_url(config.llm.server_url):
-        llm_url = config.llm.server_url
-        if not llm_url.startswith(("http://", "https://")):
-            llm_url = f"http://{llm_url}/v1/health/ready"
-        else:
-            llm_url = f"{llm_url}/v1/health/ready"
+        llm_url = readiness_url(config.llm.server_url, config.llm.model_engine)
 
         # For local services, check health and add model info
         llm_result = await check_service_health(url=llm_url, service_name="LLM")
@@ -304,11 +326,9 @@ async def check_all_services_health(
         if config.query_rewriter.server_url and not is_nvidia_api_catalog_url(
             config.query_rewriter.server_url
         ):
-            qr_url = config.query_rewriter.server_url
-            if not qr_url.startswith(("http://", "https://")):
-                qr_url = f"http://{qr_url}/v1/health/ready"
-            else:
-                qr_url = f"{qr_url}/v1/health/ready"
+            qr_url = readiness_url(
+                config.query_rewriter.server_url, config.llm.model_engine
+            )
 
             # For local services, check health and add model info
             qr_result = await check_service_health(
@@ -335,19 +355,9 @@ async def check_all_services_health(
     if config.embeddings.server_url and not is_nvidia_api_catalog_url(
         config.embeddings.server_url
     ):
-        embed_url = config.embeddings.server_url
-        if not embed_url.startswith(("http://", "https://")):
-            embed_url = f"http://{embed_url}"
-        
-        # Check if version suffix (v1, v2, vN) is already present in the URL
-        has_version = re.search(r'/v\d+(?:/|$)', embed_url)
-        
-        if has_version:
-            # Version already present, just add /health/ready
-            embed_url = f"{embed_url.rstrip('/')}/health/ready"
-        else:
-            # No version present, add /v1/health/ready
-            embed_url = f"{embed_url.rstrip('/')}/v1/health/ready"
+        embed_url = readiness_url(
+            config.embeddings.server_url, config.embeddings.model_engine
+        )
 
         # For local services, check health and add model info
         embed_result = await check_service_health(
@@ -376,11 +386,9 @@ async def check_all_services_health(
         if config.ranking.server_url and not is_nvidia_api_catalog_url(
             config.ranking.server_url
         ):
-            ranking_url = config.ranking.server_url
-            if not ranking_url.startswith(("http://", "https://")):
-                ranking_url = f"http://{ranking_url}/v1/health/ready"
-            else:
-                ranking_url = f"{ranking_url}/v1/health/ready"
+            ranking_url = readiness_url(
+                config.ranking.server_url, config.ranking.model_engine
+            )
 
             # For local services, check health and add model info
             ranking_result = await check_service_health(
@@ -432,10 +440,7 @@ async def check_all_services_health(
         reflection_llm = os.getenv("REFLECTION_LLM", "").strip('"').strip("'")
         reflection_url = os.getenv("REFLECTION_LLM_SERVERURL", "").strip('"').strip("'")
         if reflection_url:
-            if not reflection_url.startswith(("http://", "https://")):
-                reflection_url = f"http://{reflection_url}/v1/health/ready"
-            else:
-                reflection_url = f"{reflection_url}/v1/health/ready"
+            reflection_url = readiness_url(reflection_url, config.llm.model_engine)
 
             # For local services, check health and add model info
             reflection_result = await check_service_health(
