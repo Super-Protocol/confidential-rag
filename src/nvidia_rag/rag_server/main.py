@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: relevance-score normalisation is skipped for the
+# `tei` ranking engine, whose score is already a probability — see
+# `_normalize_relevance_scores`.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -4134,8 +4138,30 @@ class NvidiaRAG:
 
         Returns:
             The same list of documents with normalized scores
+
+        Modified by Super Protocol, 2026: skipped for a reranker whose score is
+        already a probability.
+
+        `sigmoid(0.1 * x)` is written for the unbounded logit a NeMo Retriever
+        reranker returns — a logit of 10 becomes 0.73, of -10 becomes 0.27, and
+        the threshold below it is then meaningful. A cross-encoder served over
+        Text Embeddings Inference returns a probability in [0, 1] instead, and
+        putting that through the same function crushes every score into
+        [0.500, 0.525]: measured, a passage the reranker scored 0.989 came out
+        at 0.5247 and four it scored below 0.002 all came out at 0.500.
+
+        The ordering survives, because the transform is monotonic — which is why
+        this is invisible in an answer and shows up only in the numbers. What
+        does not survive is `RERANKER_SCORE_THRESHOLD`: every value up to 0.5
+        filters nothing and every value past 0.526 filters everything, so the
+        one control an operator has over relevance silently stops working.
         """
         if not documents:
+            return documents
+
+        if self.config.ranking.model_engine == "tei":
+            # Already in [0, 1] and already comparable. Normalising a probability
+            # is not a no-op, it is a narrowing.
             return documents
 
         # Apply sigmoid normalization (1 / (1 + e^-x))
