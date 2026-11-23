@@ -1134,7 +1134,12 @@ class TestMilvusVDB:
     def test_retrieval_langchain(
         self, mock_otel, mock_time, mock_connections
     ):
-        """Test retrieval_langchain method (real LCEL chain, mocked retriever only)."""
+        """Test retrieval_langchain method (real LCEL chain, mocked search only).
+
+        Modified by Super Protocol, 2026: the dense path searches with
+        `similarity_search_with_score` rather than through `as_retriever`, so
+        that the similarity it computes is kept instead of dropped (SUP-889).
+        """
         mock_config = Mock()
         mock_time.time.side_effect = [0.0, 1.5]
 
@@ -1147,7 +1152,10 @@ class TestMilvusVDB:
             Document(page_content="doc1", metadata={"source": "file1.txt"}),
             Document(page_content="doc2", metadata={"source": "file2.txt"}),
         ]
-        mock_retriever.invoke.return_value = mock_docs
+        mock_vectorstore.similarity_search_with_score.return_value = [
+            (mock_docs[0], 0.4),
+            (mock_docs[1], 1.0),
+        ]
 
         mock_token = Mock()
         mock_otel.attach.return_value = mock_token
@@ -1174,8 +1182,14 @@ class TestMilvusVDB:
         assert len(result) == 2
         for doc in result:
             assert doc.metadata["collection_name"] == "test_collection"
+        # Super Protocol, 2026: the search's own number survives the call, as a
+        # distance under its own name and as a similarity in the same order.
+        assert [doc.metadata["retriever_distance"] for doc in result] == [0.4, 1.0]
+        assert result[0].metadata["retriever_score"] > result[1].metadata["retriever_score"]
         mock_get_vs.assert_called_once_with("test_collection")
-        mock_retriever.invoke.assert_called_once()
+        mock_vectorstore.similarity_search_with_score.assert_called_once_with(
+            "test query", k=5, expr="filter"
+        )
         mock_otel.attach.assert_called_once_with(mock_ctx)
         mock_otel.detach.assert_called_once_with(mock_token)
 
@@ -1191,8 +1205,8 @@ class TestMilvusVDB:
         mock_retriever = Mock()
         mock_vectorstore.as_retriever.return_value = mock_retriever
         mock_retriever.vectorstore.collection_name = "test_collection"
-        mock_retriever.invoke.side_effect = requests.exceptions.ConnectionError(
-            "Connection failed"
+        mock_vectorstore.similarity_search_with_score.side_effect = (
+            requests.exceptions.ConnectionError("Connection failed")
         )
 
         with patch("nvidia_rag.utils.vdb.milvus.milvus_vdb.urlparse"):
@@ -1421,7 +1435,7 @@ class TestMilvusVDB:
         mock_docs = [
             Document(page_content="doc1", metadata={"source": "file1.txt"}),
         ]
-        mock_retriever.invoke.return_value = mock_docs
+        mock_vectorstore.similarity_search_with_score.return_value = [(mock_docs[0], 0.0)]
 
         with patch("nvidia_rag.utils.vdb.milvus.milvus_vdb.urlparse"):
             vdb = MilvusVDB(
@@ -1441,4 +1455,9 @@ class TestMilvusVDB:
 
         assert len(result) == 1
         assert result[0].metadata["collection_name"] == "test_collection"
-        mock_retriever.invoke.assert_called_once_with("test query", expr="")
+        # Super Protocol, 2026: a distance of 0 is a perfect match, so the
+        # similarity carried beside it is 1.0 (SUP-889).
+        assert result[0].metadata["retriever_score"] == 1.0
+        mock_vectorstore.similarity_search_with_score.assert_called_once_with(
+            "test query", k=5, expr=""
+        )

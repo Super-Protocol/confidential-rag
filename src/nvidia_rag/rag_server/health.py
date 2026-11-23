@@ -6,6 +6,12 @@
 # and Text Embeddings Inference answer on `/health`, so an open stack reported
 # every one of its components unhealthy while serving correctly.
 #
+# Modified by Super Protocol, 2026: the Ranking entry reports the reranker's last
+# ACTUAL rerank, not only whether its health endpoint answers. A reranker that
+# refuses every batch with 413 answers `/health` with 200 — so the probe alone
+# called it healthy for the whole of the Confidential RAG pilot while it did no
+# work on any query (SUP-889).
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -46,6 +52,7 @@ from nvidia_rag.utils.health_models import (
     StorageHealthInfo,
 )
 from nvidia_rag.utils.object_store import get_object_store_operator
+from nvidia_rag.utils.reranker_status import current as reranker_status
 from nvidia_rag.utils.vdb.vdb_base import VDBRag
 
 logger = logging.getLogger(__name__)
@@ -256,6 +263,35 @@ def is_nvidia_api_catalog_url(url: str) -> bool:
     )
 
 
+def _with_rerank_outcome(report: NIMServiceHealthInfo) -> NIMServiceHealthInfo:
+    """Let the last real rerank overrule a health probe that says nothing.
+
+    Added by Super Protocol, 2026 (SUP-889). `/health` on Text Embeddings
+    Inference reports that the process is up. It does not report that `/rerank`
+    refused the batch the pipeline actually sends, which is the failure that
+    matters: the adapter falls back to the retriever's order, the answers stay
+    plausible, and the component this deployment advertises and attests does no
+    work. `nvidia_rag.utils.reranker_status` holds what the last rerank did, and
+    a degradation there is louder than a 200 from the probe.
+
+    A reachable endpoint that has not been asked anything yet is left as the
+    probe found it: no query has been served, so there is nothing to degrade.
+    """
+    outcome = reranker_status()
+    if not outcome.degraded:
+        return report
+    message = (
+        f"reranking is degraded: {outcome.reason}"
+        if outcome.reason
+        else "reranking is degraded: the last rerank fell back to the retriever's order"
+    )
+    if outcome.observed_at:
+        message = f"{message} (last attempt {outcome.observed_at})"
+    return report.model_copy(
+        update={"status": ServiceStatus.DEGRADED, "message": message}
+    )
+
+
 async def check_all_services_health(
     vdb_op: VDBRag, config: NvidiaRAGConfig | None = None
 ) -> RAGHealthResponse:
@@ -395,19 +431,25 @@ async def check_all_services_health(
                 url=ranking_url, service_name="Ranking"
             )
             nim.append(
-                ranking_result.model_copy(update={"model": config.ranking.model_name})
+                _with_rerank_outcome(
+                    ranking_result.model_copy(
+                        update={"model": config.ranking.model_name}
+                    )
+                )
             )
         else:
             # When URL is empty or from API catalog, assume the service is
             # running via API catalog
             nim.append(
-                NIMServiceHealthInfo(
-                    service="Ranking",
-                    model=config.ranking.model_name,
-                    url=config.ranking.server_url or "",
-                    status=ServiceStatus.HEALTHY,
-                    latency_ms=0,
-                    message="Using NVIDIA API Catalog",
+                _with_rerank_outcome(
+                    NIMServiceHealthInfo(
+                        service="Ranking",
+                        model=config.ranking.model_name,
+                        url=config.ranking.server_url or "",
+                        status=ServiceStatus.HEALTHY,
+                        latency_ms=0,
+                        message="Using NVIDIA API Catalog",
+                    )
                 )
             )
 

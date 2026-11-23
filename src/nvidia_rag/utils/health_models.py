@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: `ServiceStatus.DEGRADED` — reachable and not
+# doing its job, which is the state a reranker refusing every batch is in.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -27,6 +30,12 @@ class ServiceStatus(str, Enum):
     """Enum for service health status values."""
 
     HEALTHY = "healthy"
+    # Added by Super Protocol, 2026: reachable and not doing its job. The state
+    # that had no name here is the one the reranker was in for every query of
+    # the Confidential RAG pilot — `/health` answered 200 while `/rerank`
+    # refused every batch, so "healthy" and "unhealthy" were both wrong and the
+    # report said healthy (SUP-889).
+    DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
     SKIPPED = "skipped"
     TIMEOUT = "timeout"

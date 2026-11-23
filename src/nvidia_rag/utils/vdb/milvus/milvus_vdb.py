@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: the dense retrieval path keeps the similarity
+# it already computes. `similarity_search` is `similarity_search_with_score` with
+# the number dropped, and that number is the only honest thing a reranker
+# fallback can report as a score.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -95,6 +100,48 @@ logger = logging.getLogger(__name__)
 # Above this many document-info entries, get_documents skips Milvus query iteration
 # and omits per-document metadata in the response.
 BYPASS_METADATA_THRESHOLD = 1000
+
+
+def _carry_retriever_scores(
+    scored: list[tuple[Document, float]],
+) -> list[Document]:
+    """Keep the dense retriever's own score on the documents it returned.
+
+    Added by Super Protocol, 2026 (SUP-889). Two numbers go onto each document:
+
+    * `retriever_distance` — exactly what Milvus answered, untouched. This
+      collection is searched with `metric_type: L2`, so it is a distance and
+      SMALLER IS BETTER, which is the opposite of every other score in this
+      pipeline. Carried under its own name for that reason: a field called
+      "score" that is ordered backwards is a trap, and `relevance_score`
+      already means "higher is better" to the citation builder, the console and
+      `filter_documents_by_confidence`.
+    * `retriever_score` — the same ranking as a similarity in [0, 1], which is
+      what `TEIRerank` keeps as the score when the reranker is unreachable.
+
+    The transform is `1 - d^2 / 4`. For unit vectors — which is what both
+    embedders this listing serves return, Text Embeddings Inference normalising
+    by default — `d^2 = 2 - 2cos`, so this is exactly `(1 + cos) / 2`: the
+    cosine similarity mapped onto [0, 1]. For vectors that are not unit length
+    it is still strictly decreasing in the distance, so the ORDER it reports is
+    the retriever's own order either way, which is the property a fallback
+    needs. Clamped, because an unnormalised corpus can put `d` outside [0, 2]
+    and a score of -3 would be read as "no score" by everything downstream.
+    """
+    docs: list[Document] = []
+    for doc, distance in scored:
+        try:
+            value = float(distance)
+        except (TypeError, ValueError):
+            logger.warning("Milvus returned %r as a distance; not carried", distance)
+            docs.append(doc)
+            continue
+        doc.metadata["retriever_distance"] = value
+        doc.metadata["retriever_score"] = max(
+            0.0, min(1.0, 1.0 - (value * value) / 4.0)
+        )
+        docs.append(doc)
+    return docs
 
 
 class MilvusVDB(VDBRagIngest):
@@ -1206,10 +1253,17 @@ class MilvusVDB(VDBRagIngest):
                     )
                 )
             else:
+                # The dense path asks for the score as well as the document, and
+                # keeps it. `similarity_search` is `similarity_search_with_score`
+                # with the number dropped on the floor, and that number is the
+                # whole of what the retriever's ordering is made of — so the one
+                # thing a reranker fallback could honestly report was being
+                # thrown away one call before it was needed (SUP-889).
                 retriever_lambda = RunnableLambda(
-                    lambda x: retriever.invoke(
-                        x,
-                        expr=filter_expr,
+                    lambda x: _carry_retriever_scores(
+                        vectorstore.similarity_search_with_score(
+                            x, k=top_k, expr=filter_expr
+                        )
                     )
                 )
             retriever_chain = {"context": retriever_lambda} | RunnableAssign(

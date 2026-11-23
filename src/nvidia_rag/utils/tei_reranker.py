@@ -36,6 +36,24 @@ One differs, and it matters when reading a score: a cross-encoder reranker
 returns a probability in [0, 1] (`raw_scores: false`), where the NIM returns an
 unbounded logit. A `RERANKER_SCORE_THRESHOLD` carried over from a NIM deployment
 means something else here.
+
+**And one is new, because the first version of it hid a component doing nothing.**
+When the endpoint cannot be reached or refuses the batch, this falls back to the
+retriever's own order — correctly: reranking refines an answer we already have,
+and losing it should cost the ordering, not the query. But the first version
+returned those documents with no score at all, so every citation read
+`relevance_score` 0.0 and nothing anywhere said why. That silence is how a
+reranker refusing every batch with `413` survived two review rounds of the
+Confidential RAG listing (SUP-840). So a fallback now:
+
+* keeps the retriever's own similarity as the score, which is the number the
+  ordering it fell back to is actually made of;
+* marks every document it returns with `reranker_degraded` and the reason;
+* records the same fact in `nvidia_rag.utils.reranker_status`, where
+  `/v1/health` reads it.
+
+A degraded answer is still an answer. What it must not be is indistinguishable
+from a good one.
 """
 
 import logging
@@ -47,9 +65,22 @@ from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from pydantic import ConfigDict
 
+from nvidia_rag.utils.reranker_status import (
+    DEGRADED_KEY,
+    DEGRADED_REASON_KEY,
+    record_degradation,
+    record_success,
+)
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["TEIRerank"]
+__all__ = ["RETRIEVER_SCORE_KEY", "TEIRerank"]
+
+#: Where the retriever leaves the similarity it computed, written by
+#: `MilvusVDB.retrieval_langchain`. It is what a fallback keeps as the score:
+#: the retriever's ordering is made of these numbers, so reporting them is
+#: reporting the order the answer was actually built from.
+RETRIEVER_SCORE_KEY = "retriever_score"
 
 
 class TEIRerank(BaseDocumentCompressor):
@@ -112,6 +143,57 @@ class TEIRerank(BaseDocumentCompressor):
             )
         return body
 
+    def _reason(self, error: BaseException) -> str:
+        """Why reranking did not happen, in terms an operator can act on.
+
+        An HTTP status with the body beside it, where there is one. The defect
+        this reporting exists for answered
+        `413 {"error":"batch size 40 > maximum allowed batch size 32"}` — a
+        sentence that names the fix — and it reached nothing but the log.
+        """
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            body = " ".join((getattr(response, "text", "") or "").split())[:200]
+            return f"HTTP {status} from {self._endpoint()}{': ' + body if body else ''}"
+        if isinstance(error, requests.exceptions.Timeout):
+            return (
+                f"no answer from {self._endpoint()} within {self.timeout:.0f}s — the "
+                "reranker is saturated or its thread pools are larger than its CPU limit"
+            )
+        return f"{type(error).__name__} from {self._endpoint()}: {error}".strip()
+
+    def _fallback(self, docs: list[Document], reason: str) -> list[Document]:
+        """The retriever's own order, carrying the retriever's own scores and a flag.
+
+        Three things happen here and each one exists because its absence cost a
+        review round:
+
+        * the retriever's similarity becomes `relevance_score`, so a citation
+          reads the number the ordering it got is made of rather than 0.0. A
+          document the retriever left no score on keeps none — inventing one
+          would be the same failure in a new place;
+        * every returned document is marked degraded, with the reason, so the
+          API response says so;
+        * the fact is recorded where `/v1/health` reads it, because between
+          queries there is no response to carry it.
+        """
+        kept = docs[: self.top_n]
+        for doc in kept:
+            similarity = doc.metadata.get(RETRIEVER_SCORE_KEY)
+            if similarity is not None:
+                try:
+                    doc.metadata["relevance_score"] = float(similarity)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "the retriever left %r as its similarity, which is not a number",
+                        similarity,
+                    )
+            doc.metadata[DEGRADED_KEY] = True
+            doc.metadata[DEGRADED_REASON_KEY] = reason
+        record_degradation(reason)
+        return kept
+
     def compress_documents(
         self,
         documents: list[Document],
@@ -126,15 +208,16 @@ class TEIRerank(BaseDocumentCompressor):
         texts = [doc.page_content or "" for doc in docs]
         try:
             rankings = self._rank(query, texts)
-        except Exception:
+        except Exception as error:  # noqa: BLE001 — every failure is one fallback
             # Reranking is a refinement of an answer we already have. Losing the
             # endpoint should cost the ordering, not the query — upstream's
             # retriever is already ordered by vector distance.
+            reason = self._reason(error)
             logger.exception(
-                "Reranking failed at %s; falling back to the retriever's own order",
-                self._endpoint(),
+                "Reranking failed (%s); falling back to the retriever's own order",
+                reason,
             )
-            return docs[: self.top_n]
+            return self._fallback(docs, reason)
 
         ranked: list[Document] = []
         for entry in sorted(
@@ -142,11 +225,18 @@ class TEIRerank(BaseDocumentCompressor):
         ):
             index = entry.get("index")
             if not isinstance(index, int) or not 0 <= index < len(docs):
-                logger.warning("Reranker returned out-of-range index %r; skipped", index)
+                logger.warning(
+                    "Reranker returned out-of-range index %r; skipped", index
+                )
                 continue
             doc = docs[index]
             doc.metadata["relevance_score"] = entry.get("score", 0.0)
+            # A document can reach a second query through a cache, and a stale
+            # flag is a degradation reported for an answer that did not have one.
+            doc.metadata.pop(DEGRADED_KEY, None)
+            doc.metadata.pop(DEGRADED_REASON_KEY, None)
             ranked.append(doc)
             if len(ranked) >= self.top_n:
                 break
+        record_success()
         return ranked

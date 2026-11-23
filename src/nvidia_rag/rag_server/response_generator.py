@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Super Protocol, 2026: `Citations` carries a `reranker` report, so a
+# degraded reranking is in the answer it degraded rather than only in a log.
+#
+# Modified by Super Protocol, 2026: a citation's bounding box is read from
+# `table_metadata.table_location` / `image_metadata.image_location`.
+# `content_metadata.location`, which is what upstream reads, is not a field of
+# `ContentMetadataSchema` and the schema forbids extras — so it resolved to None
+# for every table and image citation ever produced (found on SUP-874).
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -233,6 +242,41 @@ class SourceResult(BaseModel):
     metadata: SourceMetadata
 
 
+class RerankerReport(BaseModel):
+    """Whether reranking happened for the answer these citations belong to.
+
+    Added by Super Protocol, 2026 (SUP-889). `TEIRerank` falls back to the
+    retriever's own order when the reranker endpoint refuses or does not answer,
+    which keeps the query working — and used to leave no trace outside a log,
+    so a reranker that did no work on any query was indistinguishable from one
+    that worked. A degraded answer is reported as a degraded answer.
+
+    `degraded: false` with no `reason` is the ordinary case and says the scores
+    below came from the cross-encoder.
+    """
+
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when the reranker did not score these documents and the "
+            "retriever's own order was kept instead."
+        ),
+    )
+    reason: str = Field(
+        default="",
+        max_length=4096,
+        pattern=r"[\s\S]*",
+        description="Why reranking did not happen, where the endpoint said.",
+    )
+    score_source: Literal["reranker", "retriever"] = Field(
+        default="reranker",
+        description=(
+            "What produced the `score` on each result: the cross-encoder, or "
+            "the retriever's own similarity when reranking was lost."
+        ),
+    )
+
+
 class Citations(BaseModel):
     """Represents the sources section of the API response."""
 
@@ -246,6 +290,34 @@ class Citations(BaseModel):
     results: list[SourceResult] = Field(
         default=[], description="List of document results"
     )
+    # Super Protocol, 2026: see RerankerReport. Default-constructed rather than
+    # optional, so a client never has to tell "reranking was fine" apart from
+    # "this build does not report it".
+    reranker: RerankerReport = Field(
+        default_factory=lambda: RerankerReport(),
+        description="Whether reranking produced the scores on these results.",
+    )
+
+
+def reranker_report(documents: list[Document]) -> RerankerReport:
+    """Read the degradation `TEIRerank` marked on the documents, if any.
+
+    Added by Super Protocol, 2026. The flag travels on the documents rather than
+    through the call chain because every path that builds citations — the plain
+    one, reflection, query decomposition, the agentic runner — hands this
+    function the documents and nothing else, and a degradation that only one of
+    them reported would be a degradation nobody sees on the others.
+    """
+    for doc in documents:
+        if doc.metadata.get("reranker_degraded"):
+            return RerankerReport(
+                degraded=True,
+                reason=str(doc.metadata.get("reranker_degradation_reason") or "")[
+                    :4096
+                ],
+                score_source="retriever",
+            )
+    return RerankerReport()
 
 
 class ImageUrl(BaseModel):
@@ -898,6 +970,47 @@ async def generate_answer_async(
             yield msg
 
 
+def element_location(doc: Document) -> tuple[list[float], list[int]]:
+    """Where on the page this chunk came from, and how big that page is.
+
+    Added by Super Protocol, 2026 (SUP-874, SUP-890). nv-ingest puts a table's
+    box in `table_metadata.table_location` and a picture's in
+    `image_metadata.image_location`. Upstream reads
+    `content_metadata.location`, which `ContentMetadataSchema` does not define
+    and, with `extra="forbid"`, cannot carry — so every table and image citation
+    reported no location at all, and a client drawing the box drew nothing.
+
+    `content_metadata.location` is still read last, for a producer that does set
+    it: nothing is taken away here, a field that works is simply read first.
+    """
+    table = doc.metadata.get("table_metadata") or {}
+    image = doc.metadata.get("image_metadata") or {}
+    content = doc.metadata.get("content_metadata") or {}
+    box = (
+        table.get("table_location")
+        or image.get("image_location")
+        or content.get("location")
+        or []
+    )
+    dimensions = (
+        table.get("table_location_max_dimensions")
+        or image.get("image_location_max_dimensions")
+        or content.get("location_max_dimensions")
+        or []
+    )
+    try:
+        box = [float(value) for value in box]
+    except (TypeError, ValueError):
+        logger.warning("a citation's location is not a box: %r", box)
+        box = []
+    try:
+        dimensions = [int(float(value)) for value in dimensions]
+    except (TypeError, ValueError):
+        logger.warning("a citation's page size is not a pair: %r", dimensions)
+        dimensions = []
+    return box, dimensions
+
+
 def prepare_citations(
     retrieved_documents: list[Document],
     force_citations: bool = False,  # True in-case of doc search api
@@ -944,10 +1057,17 @@ def prepare_citations(
                 document_type = doc.metadata.get("content_metadata", {}).get("type")
                 content_metadata = doc.metadata.get("content_metadata", {})
                 page_number = content_metadata.get("page_number", 0)
+                # Super Protocol, 2026: a text chunk extracted from a document
+                # has a box as surely as a table does — a table indexed as its
+                # Markdown is read down this branch, and the box is what lets a
+                # citation point at the page it is on (SUP-890).
+                box, box_dimensions = element_location(doc)
                 source_metadata = SourceMetadata(
                     page_number=page_number,
                     description=doc.page_content,
                     content_metadata=content_metadata,
+                    location=box,
+                    location_max_dimensions=box_dimensions,
                 )
 
             elif doc.metadata.get("content_metadata", {}).get("type", {}) in [
@@ -958,7 +1078,11 @@ def prepare_citations(
                 page_number = doc.metadata.get("content_metadata", {}).get(
                     "page_number"
                 )
-                location = doc.metadata.get("content_metadata", {}).get("location")
+                # Super Protocol, 2026: `content_metadata.location` is not a
+                # field of the schema this metadata is validated against, so
+                # upstream's read of it was None for every citation. See
+                # `element_location` (SUP-874).
+                location, location_max_dimensions = element_location(doc)
                 if doc.metadata.get("content_metadata", {}).get("type") == "image":
                     document_type = doc.metadata.get("content_metadata", {}).get("type")
                 else:
@@ -983,6 +1107,7 @@ def prepare_citations(
                         source_metadata = SourceMetadata(
                             page_number=page_number,
                             location=location,
+                            location_max_dimensions=location_max_dimensions,
                             description=doc.page_content,
                             content_metadata=doc.metadata.get("content_metadata"),
                         )
@@ -1021,7 +1146,13 @@ def prepare_citations(
                 )
                 citations.append(source_result)
 
-    return Citations(total_results=len(citations), results=citations)
+    return Citations(
+        total_results=len(citations),
+        results=citations,
+        # Super Protocol, 2026: read off the documents, so the answer says
+        # whether its own scores came from the reranker (SUP-889).
+        reranker=reranker_report(retrieved_documents),
+    )
 
 
 def prepare_citations_nrl(
@@ -1207,7 +1338,13 @@ def prepare_citations_nrl(
         len(citations),
         len(retrieved_documents),
     )
-    return Citations(total_results=len(citations), results=citations)
+    return Citations(
+        total_results=len(citations),
+        results=citations,
+        # Super Protocol, 2026: read off the documents, so the answer says
+        # whether its own scores came from the reranker (SUP-889).
+        reranker=reranker_report(retrieved_documents),
+    )
 
 
 def error_response_generator(exception_msg: str):
