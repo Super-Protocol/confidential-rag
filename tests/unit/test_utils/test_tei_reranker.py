@@ -366,6 +366,51 @@ class TestTheRetrieverKeepsItsOwnScore:
         # for a score.
         assert [doc.metadata["retriever_distance"] for doc in out] == [0.0, 0.5, 1.4]
 
+    @pytest.mark.parametrize(
+        "cosine",
+        [1.0, 0.75, 0.5, 0.25, 0.0, -0.25, -0.5, -1.0],
+    )
+    def test_the_score_is_the_cosine_mapped_onto_zero_one(self, cosine):
+        """The identity the docstring claims, pinned on the number Milvus sends.
+
+        `metric_type: L2` in Milvus is the SQUARED Euclidean distance, so for
+        unit vectors the search answers `2 - 2cos` and the score must come back
+        as `(1 + cos) / 2`. Monotonicity and bounds do not pin this: `1 - d^2/4`
+        on the same input is `1 - (1 - cos)^2`, which agrees at `cos = 1`, is
+        ordered the same for every `cos >= 0`, and collapses to 0.0 for every
+        document the query points away from. That is the whole defect, so the
+        test has to assert the value and not the order.
+        """
+        from nvidia_rag.utils.vdb.milvus.milvus_vdb import _carry_retriever_scores
+
+        squared_distance = 2.0 - 2.0 * cosine  # |a - b|^2 for unit a, b
+        out = _carry_retriever_scores(
+            [(Document(page_content="d"), squared_distance)]
+        )
+
+        assert out[0].metadata[RETRIEVER_SCORE_KEY] == pytest.approx(
+            (1.0 + cosine) / 2.0
+        )
+        # And what Milvus answered is carried through untransformed.
+        assert out[0].metadata["retriever_distance"] == pytest.approx(
+            squared_distance
+        )
+
+    def test_a_document_the_query_points_away_from_still_scores(self):
+        """A negative cosine is a low score, not the absence of one.
+
+        0.1.8 read 0.0 for every such document, which is the value the console
+        and `filter_documents_by_confidence` both treat as "the reranker said
+        nothing" — so on the degraded path a merely-unrelated passage was
+        indistinguishable from an unscored one.
+        """
+        from nvidia_rag.utils.vdb.milvus.milvus_vdb import _carry_retriever_scores
+
+        out = _carry_retriever_scores(
+            [(Document(page_content="d"), 2.0 - 2.0 * -0.6)]
+        )
+        assert 0.0 < out[0].metadata[RETRIEVER_SCORE_KEY] < 0.5
+
     def test_a_distance_outside_the_unit_sphere_is_clamped_not_negative(self):
         from nvidia_rag.utils.vdb.milvus.milvus_vdb import _carry_retriever_scores
 

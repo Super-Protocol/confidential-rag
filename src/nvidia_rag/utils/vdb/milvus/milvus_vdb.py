@@ -119,14 +119,22 @@ def _carry_retriever_scores(
     * `retriever_score` — the same ranking as a similarity in [0, 1], which is
       what `TEIRerank` keeps as the score when the reranker is unreachable.
 
-    The transform is `1 - d^2 / 4`. For unit vectors — which is what both
-    embedders this listing serves return, Text Embeddings Inference normalising
-    by default — `d^2 = 2 - 2cos`, so this is exactly `(1 + cos) / 2`: the
-    cosine similarity mapped onto [0, 1]. For vectors that are not unit length
-    it is still strictly decreasing in the distance, so the ORDER it reports is
-    the retriever's own order either way, which is the property a fallback
-    needs. Clamped, because an unnormalised corpus can put `d` outside [0, 2]
-    and a score of -3 would be read as "no score" by everything downstream.
+    The transform is `1 - d_sq / 4`, where `d_sq` is the number Milvus answered.
+    For `metric_type: L2` Milvus returns the SQUARED Euclidean distance — it
+    skips the square root, and langchain-milvus passes `result["distance"]`
+    through unchanged — so what arrives here is already `d^2`. For unit vectors,
+    which is what both embedders this listing serves return (Text Embeddings
+    Inference normalises by default), `d^2 = 2 - 2cos`, so `1 - d_sq / 4` is
+    exactly `(1 + cos) / 2`: the cosine similarity mapped onto [0, 1]. That
+    identity is pinned by a test, because a formula one square off — `1 -
+    d_sq^2 / 4`, which is what 0.1.8 shipped — preserves the order for
+    `cos >= 0` and so passes every monotonicity assertion while reading 0.0 for
+    every document the query points away from. For vectors that are not unit
+    length it is still strictly decreasing in the distance, so the ORDER it
+    reports is the retriever's own order either way, which is the property a
+    fallback needs. Clamped, because an unnormalised corpus can put `d_sq`
+    outside [0, 4] and a score of -3 would be read as "no score" by everything
+    downstream.
     """
     docs: list[Document] = []
     for doc, distance in scored:
@@ -137,9 +145,7 @@ def _carry_retriever_scores(
             docs.append(doc)
             continue
         doc.metadata["retriever_distance"] = value
-        doc.metadata["retriever_score"] = max(
-            0.0, min(1.0, 1.0 - (value * value) / 4.0)
-        )
+        doc.metadata["retriever_score"] = max(0.0, min(1.0, 1.0 - value / 4.0))
         docs.append(doc)
     return docs
 
